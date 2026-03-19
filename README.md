@@ -7,18 +7,63 @@ transferwee is a simple Python 3 script to download/upload files via
 
 ```
 % transferwee -h
-usage: transferwee [-h] {download,upload} ...
+usage: transferwee [-h] {download,auth,upload} ...
 
 Download/upload files via wetransfer.com
 
 positional arguments:
-  {download,upload}  action
-    download         download files
-    upload           upload files
+  {download,auth,upload}
+                        action
+    download            download files
+    auth                authenticate with WeTransfer (OTP via email)
+    upload              upload files
 
 optional arguments:
-  -h, --help         show this help message and exit
+  -h, --help            show this help message and exit
 ```
+
+### Authenticate
+
+`auth` subcommand authenticates with WeTransfer via a one-time
+verification code sent to your email. The resulting tokens are cached
+locally so that subsequent uploads can run without user interaction.
+
+```
+% transferwee auth -h
+usage: transferwee auth [-h] [-l] [-v] [email]
+
+positional arguments:
+  email       WeTransfer account email to authenticate
+
+optional arguments:
+  -h, --help  show this help message and exit
+  -l, --list  list cached accounts and token status
+  -v          get verbose/debug logging
+```
+
+The following example authenticates with WeTransfer. A verification code
+will be sent to the given email address:
+
+```
+% transferwee auth user@example.com
+Sending verification code to user@example.com
+Enter the verification code sent to your email: ABC123
+Authentication successful. Tokens cached to /home/user/.config/transferwee/auth_1a2b3c4d5e6f7890.json
+```
+
+Once authenticated, the cached refresh token is used automatically. To
+check which accounts are cached:
+
+```
+% transferwee auth -l
+  user@example.com
+    status: refresh_token cached
+    access_token valid until 2026-03-19 22:30 UTC, last refreshed 2026-03-19 21:30 UTC
+    file:   /home/user/.config/transferwee/auth_1a2b3c4d5e6f7890.json
+```
+
+Multiple accounts are supported. Each account gets its own cache file
+under `~/.config/transferwee/`.
 
 ### Upload files
 
@@ -32,20 +77,29 @@ also note that because `-t` option accepts several fields a `--`
 is needed to separate it with the file arguments).
 Otherwise the link upload will be used.
 
+When `-u` option is passed (or `WETRANSFER_USER` environment variable
+is set) the upload is performed as an authenticated user, which avoids
+the limits applied to anonymous transfers. Run `transferwee auth` first
+to cache the tokens.
+
 ```
 % transferwee upload -h
-usage: transferwee upload [-h] [-n display_name] [-m message] [-f from] [-t to [to ...]] [-v] file [file ...]
+usage: transferwee upload [-h] [-n display_name] [-m message] [-f from]
+                          [-t to [to ...]] [-u email] [-v]
+                          file [file ...]
 
 positional arguments:
-  file             files to upload
+  file                  files to upload
 
 optional arguments:
-  -h, --help       show this help message and exit
-  -n display_name  title for the transfer
-  -m message       message description for the transfer
-  -f from          sender email
-  -t to [to ...]   recipient emails
-  -v               get verbose/debug logging
+  -h, --help            show this help message and exit
+  -n display_name       title for the transfer
+  -m message            message description for the transfer
+  -f from               sender email
+  -t to [to ...]        recipient emails
+  -u email, --user email
+                        WeTransfer account email (or WETRANSFER_USER env var)
+  -v                    get verbose/debug logging
 ```
 
 The following example creates an `hello` text file with just `Hello world!` and
@@ -57,6 +111,22 @@ then upload it with the message passed via `-m` option:
 MD5 (hello) = 59ca0efa9f5633cb0371bbc0355478d8
 % transferwee upload -m 'Just a text file with the mandatory message...' hello
 https://we.tl/o8mGUXnxyZ
+```
+
+Authenticated upload example:
+
+```
+% transferwee auth user@example.com
+% transferwee upload -u user@example.com hello
+https://we.tl/t-AbCdEfGhIj
+```
+
+Or using the environment variable:
+
+```
+% export WETRANSFER_USER=user@example.com
+% transferwee upload hello
+https://we.tl/t-AbCdEfGhIj
 ```
 
 ### Download file

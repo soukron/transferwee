@@ -47,6 +47,7 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import os.path
 import re
 import time
@@ -62,6 +63,10 @@ WETRANSFER_FINALIZE_URL = WETRANSFER_API_URL + "/{transfer_id}/finalize"
 
 WETRANSFER_EXPIRE_IN = 604800
 WETRANSFER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0"
+
+WETRANSFER_AUTH0_URL = "https://auth.wetransfer.com/oauth/token"
+WETRANSFER_AUTH0_CLIENT_ID = "dXWFQjiW1jxWCFG0hOVpqrk4h9vGeanc"
+WETRANSFER_AUTH0_AUDIENCE = "aud://transfer-api-prod.wetransfer/"
 
 
 logger = logging.getLogger(__name__)
@@ -293,23 +298,184 @@ def _verify_email_upload(
     return response.json()
 
 
+WETRANSFER_AUTH_CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "transferwee",
+)
+
+
+def _auth_cache_path(email: str) -> str:
+    """Return the cache file path for a given email."""
+    email_hash = hashlib.sha256(email.lower().encode()).hexdigest()[:16]
+    return os.path.join(WETRANSFER_AUTH_CACHE_DIR, f"auth_{email_hash}.json")
+
+
+def _save_auth_cache(
+    email: str,
+    access_token: str,
+    refresh_token: Optional[str],
+) -> None:
+    """Persist auth tokens to disk for later reuse."""
+    if not refresh_token:
+        return
+    cache_file = _auth_cache_path(email)
+    os.makedirs(WETRANSFER_AUTH_CACHE_DIR, mode=0o700, exist_ok=True)
+    payload = {
+        "email": email,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+    }
+    with open(cache_file, "w") as f:
+        json.dump(payload, f)
+    os.chmod(cache_file, 0o600)
+    logger.debug(f"Auth tokens cached to {cache_file}")
+
+
+def _load_cached_auth(email: str) -> Optional[str]:
+    """Try to obtain a fresh access_token using a cached refresh_token.
+
+    Return access_token on success, None otherwise.
+    """
+    cache_file = _auth_cache_path(email)
+    if not os.path.exists(cache_file):
+        logger.debug("No auth cache found")
+        return None
+
+    try:
+        with open(cache_file, "r") as f:
+            cache = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.debug(f"Could not read auth cache: {e}")
+        return None
+
+    refresh_token = cache.get("refresh_token")
+    if not refresh_token:
+        logger.debug("No refresh_token in cache")
+        return None
+
+    logger.debug("Attempting token refresh")
+    data = {
+        "grant_type": "refresh_token",
+        "client_id": WETRANSFER_AUTH0_CLIENT_ID,
+        "audience": WETRANSFER_AUTH0_AUDIENCE,
+        "refresh_token": refresh_token,
+    }
+    r = requests.post(
+        WETRANSFER_AUTH0_URL,
+        headers={
+            "User-Agent": WETRANSFER_USER_AGENT,
+            "Content-Type": "application/json",
+        },
+        json=data,
+    )
+    if r.status_code != 200:
+        logger.debug(f"Token refresh failed ({r.status_code}): {r.text[:200]}")
+        return None
+
+    token_data = r.json()
+    new_access = token_data.get("access_token")
+    new_refresh = token_data.get("refresh_token", refresh_token)
+    if new_access:
+        _save_auth_cache(email, new_access, new_refresh)
+        logger.debug("Token refresh successful")
+        return new_access
+
+    return None
+
+
+def _authenticate_otp(email: str) -> Dict[str, str]:
+    """Authenticate via WeTransfer passwordless OTP flow.
+
+    Triggers a verification code to the given email, prompts the user
+    to enter it, and exchanges it for Auth0 tokens.
+
+    Return dict with "access_token" and optionally "refresh_token".
+    """
+    logger.debug(f"Requesting OTP code for {email}")
+    data = {"client_id": WETRANSFER_AUTH0_CLIENT_ID, "email": email}
+    r = requests.post(
+        "https://wetransfer.com/adroit/api/v1/login/passwordless",
+        json=data,
+    )
+    r.raise_for_status()
+
+    code = input("Enter the verification code sent to your email: ")
+
+    logger.debug("Exchanging OTP for access_token")
+    data = {
+        "grant_type": "http://auth0.com/oauth/grant-type/passwordless/otp",
+        "client_id": WETRANSFER_AUTH0_CLIENT_ID,
+        "audience": WETRANSFER_AUTH0_AUDIENCE,
+        "otp": code,
+        "realm": "email",
+        "username": email,
+        "scope": "openid offline_access",
+    }
+    r = requests.post(
+        WETRANSFER_AUTH0_URL,
+        headers={
+            "User-Agent": WETRANSFER_USER_AGENT,
+            "x-csrf-token": "csrf-token",
+        },
+        json=data,
+    )
+    r.raise_for_status()
+    logger.debug("OTP authentication successful")
+    token_data = r.json()
+    result = {"access_token": token_data["access_token"]}
+    if "refresh_token" in token_data:
+        result["refresh_token"] = token_data["refresh_token"]
+        logger.debug("Obtained refresh_token for caching")
+    else:
+        logger.debug("No refresh_token returned by Auth0")
+    return result
+
+
+def _authenticate(email: str) -> str:
+    """Authenticate with WeTransfer.
+
+    Tries cached refresh_token first (no user interaction needed).
+    Falls back to passwordless OTP if no cache or refresh fails.
+    Caches tokens after successful OTP for future runs.
+
+    Return access_token.
+    """
+    token = _load_cached_auth(email)
+    if token:
+        return token
+
+    logger.debug("No valid cached token, starting OTP flow")
+    otp_result = _authenticate_otp(email)
+    _save_auth_cache(
+        email,
+        otp_result["access_token"],
+        otp_result.get("refresh_token"),
+    )
+    return otp_result["access_token"]
+
+
 def _prepare_link_upload(
     filenames: List[str],
     display_name: str,
     message: str,
     session: requests.Session,
+    authenticated: bool = False,
 ) -> Dict[Any, Any]:
     """Given a list of filenames and a message prepare for the link upload.
+
+    When authenticated is False, creates an anonymous transfer.
+    When authenticated is True, creates a transfer under the logged-in account.
 
     Return the parsed JSON response.
     """
     j = {
-        "anonymous_transfer": True,
         "files": [_file_name_and_size(f) for f in filenames],
         "display_name": display_name,
         "message": message,
         "ui_language": "en",
     }
+    if not authenticated:
+        j["anonymous_transfer"] = True
 
     r = session.post(WETRANSFER_API_URL, json=j)
     r.raise_for_status()
@@ -549,12 +715,94 @@ def _finalize_upload(
     return r.json()
 
 
+def auth_list() -> None:
+    """List all cached WeTransfer accounts and their token status."""
+    import glob
+    import datetime
+
+    pattern = os.path.join(WETRANSFER_AUTH_CACHE_DIR, "auth_*.json")
+    cache_files = glob.glob(pattern)
+
+    if not cache_files:
+        print("No cached accounts found.")
+        print(f"  Cache directory: {WETRANSFER_AUTH_CACHE_DIR}")
+        print('  Run "transferwee auth <email>" to authenticate.')
+        return
+
+    for cache_file in sorted(cache_files):
+        try:
+            with open(cache_file, "r") as f:
+                cache = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        email = cache.get("email", "unknown")
+        has_refresh = bool(cache.get("refresh_token"))
+
+        token_info = ""
+        access_token = cache.get("access_token", "")
+        try:
+            payload = json.loads(
+                binascii.a2b_base64(access_token.split(".")[1] + "==")
+            )
+            iat = datetime.datetime.utcfromtimestamp(payload.get("iat", 0))
+            exp = datetime.datetime.utcfromtimestamp(payload.get("exp", 0))
+            now = datetime.datetime.utcnow()
+            if now < exp:
+                token_info = f"access_token valid until {exp:%Y-%m-%d %H:%M} UTC"
+            else:
+                token_info = f"access_token expired ({exp:%Y-%m-%d %H:%M} UTC)"
+            token_info += f", last refreshed {iat:%Y-%m-%d %H:%M} UTC"
+        except Exception:
+            token_info = "could not decode token"
+
+        status = "refresh_token cached" if has_refresh else "no refresh_token"
+        print(f"  {email}")
+        print(f"    status: {status}")
+        print(f"    {token_info}")
+        print(f"    file:   {cache_file}")
+        print()
+
+
+def auth(email: str) -> None:
+    """Authenticate with WeTransfer and cache tokens for future use.
+
+    Triggers the OTP flow (a verification code is sent to the given
+    email) and stores the resulting tokens in the local cache.
+    Subsequent upload calls with the same email will use the cached
+    refresh_token without requiring user interaction.
+    """
+    cached = _load_cached_auth(email)
+    if cached:
+        logger.info(f"Already authenticated as {email} (token refreshed)")
+        return
+
+    logger.info(f"Sending verification code to {email}")
+    otp_result = _authenticate_otp(email)
+    _save_auth_cache(
+        email,
+        otp_result["access_token"],
+        otp_result.get("refresh_token"),
+    )
+    if otp_result.get("refresh_token"):
+        logger.info(
+            f"Authentication successful. Tokens cached to "
+            f"{_auth_cache_path(email)}"
+        )
+    else:
+        logger.info(
+            "Authentication successful but no refresh_token was returned. "
+            "You will need to re-authenticate on every upload."
+        )
+
+
 def upload(
     files: List[str],
     display_name: str = "",
     message: str = "",
     sender: Optional[str] = None,
     recipients: Optional[List[str]] = [],
+    user: Optional[str] = None,
 ) -> str:
     """Given a list of files upload them and return the corresponding URL.
 
@@ -566,9 +814,14 @@ def upload(
                  will be also sent
      - `recipients': list of email addresses of recipients. When the upload
                      succeed every recipients will receive an email with a link
+     - `user': WeTransfer account email for authenticated uploads (a
+               verification code will be sent to this email)
 
     If both sender and recipient parameters are passed the email upload will be
     used. Otherwise, the link upload will be used.
+
+    When user is provided the upload is performed as an authenticated user,
+    which may lift anonymous transfer limits.
 
     Return the short URL of the transfer on success.
     """
@@ -586,11 +839,22 @@ def upload(
     if len(files) != len(set(filenames)):
         raise FileExistsError("Duplicate filenames")
 
+    # Authenticate if credentials were provided
+    auth_token = None
+    if user:
+        logger.debug(f"Authenticating as {user}")
+        auth_token = _authenticate(user)
+        logger.debug("Authentication successful")
+
     logger.debug("Preparing to upload")
     transfer = None
     s = _prepare_session()
     if not s:
         raise ConnectionError("Could not prepare session")
+
+    if auth_token:
+        s.headers.update({"Authorization": f"Bearer {auth_token}"})
+
     if sender and recipients:
         # email upload
         transfer = _prepare_email_upload(
@@ -599,7 +863,10 @@ def upload(
         transfer = _verify_email_upload(transfer, s)
     else:
         # link upload
-        transfer = _prepare_link_upload(files, display_name, message, s)
+        transfer = _prepare_link_upload(
+            files, display_name, message, s,
+            authenticated=auth_token is not None,
+        )
 
     logger.debug(
         "From storm_upload_token WETRANSFER_STORM_PREFLIGHT URL is: "
@@ -678,6 +945,28 @@ if __name__ == "__main__":
         help="URL (we.tl/... or wetransfer.com/downloads/...)",
     )
 
+    # auth subcommand
+    authp = sp.add_parser(
+        "auth",
+        help="authenticate with WeTransfer (OTP via email)",
+    )
+    authp.add_argument(
+        "email",
+        nargs="?",
+        type=str,
+        metavar="email",
+        help="WeTransfer account email to authenticate",
+    )
+    authp.add_argument(
+        "-l",
+        "--list",
+        action="store_true",
+        help="list cached accounts and token status",
+    )
+    authp.add_argument(
+        "-v", action="store_true", help="get verbose/debug logging"
+    )
+
     # upload subcommand
     up = sp.add_parser("upload", help="upload files")
     up.add_argument(
@@ -699,6 +988,14 @@ if __name__ == "__main__":
         "-t", nargs="+", type=str, metavar="to", help="recipient emails"
     )
     up.add_argument(
+        "-u",
+        "--user",
+        type=str,
+        default=os.environ.get("WETRANSFER_USER"),
+        metavar="email",
+        help="WeTransfer account email (or WETRANSFER_USER env var)",
+    )
+    up.add_argument(
         "-v", action="store_true", help="get verbose/debug logging"
     )
     up.add_argument(
@@ -710,6 +1007,15 @@ if __name__ == "__main__":
     if args.v:
         log.setLevel(logging.DEBUG)
 
+    if args.action == "auth":
+        if args.list:
+            auth_list()
+        elif args.email:
+            auth(args.email)
+        else:
+            authp.print_help()
+        exit(0)
+
     if args.action == "download":
         if args.g:
             for u in args.url:
@@ -720,5 +1026,10 @@ if __name__ == "__main__":
         exit(0)
 
     if args.action == "upload":
-        print(upload(args.files, args.n, args.m, args.f, args.t))
+        print(
+            upload(
+                args.files, args.n, args.m, args.f, args.t,
+                args.user,
+            )
+        )
         exit(0)
