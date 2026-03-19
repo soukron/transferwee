@@ -30,15 +30,17 @@ locally so that subsequent uploads can run without user interaction.
 
 ```
 % transferwee auth -h
-usage: transferwee auth [-h] [-l] [-v] [email]
+usage: transferwee auth [-h] [-l] [--client-id ID] [--audience URL] [-v] [email]
 
 positional arguments:
-  email       WeTransfer account email to authenticate
+  email           WeTransfer account email to authenticate
 
 optional arguments:
-  -h, --help  show this help message and exit
-  -l, --list  list cached accounts and token status
-  -v          get verbose/debug logging
+  -h, --help      show this help message and exit
+  -l, --list      list cached accounts and token status
+  --client-id ID  override Auth0 client_id (saved to oauth_config.json)
+  --audience URL  override Auth0 audience (saved to oauth_config.json)
+  -v              get verbose/debug logging
 ```
 
 The following example authenticates with WeTransfer. A verification code
@@ -64,6 +66,21 @@ check which accounts are cached:
 
 Multiple accounts are supported. Each account gets its own cache file
 under `~/.config/transferwee/`.
+
+### OAuth configuration
+
+The Auth0 `client_id` and `audience` values used for authentication are
+hardcoded with known-good defaults. If WeTransfer changes these values
+on their end, the `--client-id` and `--audience` flags on the `auth`
+subcommand allow overriding them without modifying the source code:
+
+```
+% transferwee auth --client-id NEW_ID --audience NEW_AUDIENCE user@example.com
+```
+
+The overrides are persisted to `~/.config/transferwee/oauth_config.json`
+and will be used for all subsequent auth and upload operations. If the
+config file does not exist, the built-in defaults are used.
 
 ### Upload files
 

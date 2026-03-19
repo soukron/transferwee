@@ -68,8 +68,44 @@ WETRANSFER_AUTH0_URL = "https://auth.wetransfer.com/oauth/token"
 WETRANSFER_AUTH0_CLIENT_ID = "dXWFQjiW1jxWCFG0hOVpqrk4h9vGeanc"
 WETRANSFER_AUTH0_AUDIENCE = "aud://transfer-api-prod.wetransfer/"
 
+WETRANSFER_OAUTH_CONFIG = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "transferwee",
+    "oauth_config.json",
+)
+
 
 logger = logging.getLogger(__name__)
+
+
+def _load_oauth_config() -> Dict[str, str]:
+    """Load OAuth config from disk, falling back to hardcoded defaults."""
+    config = {
+        "client_id": WETRANSFER_AUTH0_CLIENT_ID,
+        "audience": WETRANSFER_AUTH0_AUDIENCE,
+    }
+    if os.path.exists(WETRANSFER_OAUTH_CONFIG):
+        try:
+            with open(WETRANSFER_OAUTH_CONFIG, "r") as f:
+                stored = json.load(f)
+            config.update(
+                {k: v for k, v in stored.items() if k in config and v}
+            )
+            logger.debug(f"OAuth config loaded from {WETRANSFER_OAUTH_CONFIG}")
+        except (json.JSONDecodeError, OSError) as e:
+            logger.debug(f"Could not read OAuth config: {e}")
+    return config
+
+
+def _save_oauth_config(client_id: str, audience: str) -> None:
+    """Persist OAuth config overrides to disk."""
+    config_dir = os.path.dirname(WETRANSFER_OAUTH_CONFIG)
+    os.makedirs(config_dir, mode=0o700, exist_ok=True)
+    payload = {"client_id": client_id, "audience": audience}
+    with open(WETRANSFER_OAUTH_CONFIG, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.chmod(WETRANSFER_OAUTH_CONFIG, 0o600)
+    logger.debug(f"OAuth config saved to {WETRANSFER_OAUTH_CONFIG}")
 
 
 def download_url(url: str) -> Optional[str]:
@@ -354,10 +390,11 @@ def _load_cached_auth(email: str) -> Optional[str]:
         return None
 
     logger.debug("Attempting token refresh")
+    oauth_cfg = _load_oauth_config()
     data = {
         "grant_type": "refresh_token",
-        "client_id": WETRANSFER_AUTH0_CLIENT_ID,
-        "audience": WETRANSFER_AUTH0_AUDIENCE,
+        "client_id": oauth_cfg["client_id"],
+        "audience": oauth_cfg["audience"],
         "refresh_token": refresh_token,
     }
     r = requests.post(
@@ -391,8 +428,10 @@ def _authenticate_otp(email: str) -> Dict[str, str]:
 
     Return dict with "access_token" and optionally "refresh_token".
     """
+    oauth_cfg = _load_oauth_config()
+
     logger.debug(f"Requesting OTP code for {email}")
-    data = {"client_id": WETRANSFER_AUTH0_CLIENT_ID, "email": email}
+    data = {"client_id": oauth_cfg["client_id"], "email": email}
     r = requests.post(
         "https://wetransfer.com/adroit/api/v1/login/passwordless",
         json=data,
@@ -404,8 +443,8 @@ def _authenticate_otp(email: str) -> Dict[str, str]:
     logger.debug("Exchanging OTP for access_token")
     data = {
         "grant_type": "http://auth0.com/oauth/grant-type/passwordless/otp",
-        "client_id": WETRANSFER_AUTH0_CLIENT_ID,
-        "audience": WETRANSFER_AUTH0_AUDIENCE,
+        "client_id": oauth_cfg["client_id"],
+        "audience": oauth_cfg["audience"],
         "otp": code,
         "realm": "email",
         "username": email,
@@ -764,14 +803,29 @@ def auth_list() -> None:
         print()
 
 
-def auth(email: str) -> None:
+def auth(
+    email: str,
+    client_id: Optional[str] = None,
+    audience: Optional[str] = None,
+) -> None:
     """Authenticate with WeTransfer and cache tokens for future use.
 
     Triggers the OTP flow (a verification code is sent to the given
     email) and stores the resulting tokens in the local cache.
     Subsequent upload calls with the same email will use the cached
     refresh_token without requiring user interaction.
+
+    If client_id or audience are provided they are persisted to
+    oauth_config.json and used for this and all future auth flows.
     """
+    if client_id or audience:
+        current = _load_oauth_config()
+        _save_oauth_config(
+            client_id or current["client_id"],
+            audience or current["audience"],
+        )
+        logger.info(f"OAuth config saved to {WETRANSFER_OAUTH_CONFIG}")
+
     cached = _load_cached_auth(email)
     if cached:
         logger.info(f"Already authenticated as {email} (token refreshed)")
@@ -964,6 +1018,18 @@ if __name__ == "__main__":
         help="list cached accounts and token status",
     )
     authp.add_argument(
+        "--client-id",
+        type=str,
+        metavar="ID",
+        help="override Auth0 client_id (saved to oauth_config.json)",
+    )
+    authp.add_argument(
+        "--audience",
+        type=str,
+        metavar="URL",
+        help="override Auth0 audience (saved to oauth_config.json)",
+    )
+    authp.add_argument(
         "-v", action="store_true", help="get verbose/debug logging"
     )
 
@@ -1011,7 +1077,7 @@ if __name__ == "__main__":
         if args.list:
             auth_list()
         elif args.email:
-            auth(args.email)
+            auth(args.email, args.client_id, args.audience)
         else:
             authp.print_help()
         exit(0)
