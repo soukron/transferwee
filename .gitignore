@@ -1,1 +1,17 @@
-__pycache__
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Node / Frontend
+node_modules/
+dsm/frontend/dist/
+dsm/frontend/package-lock.json
+
+# SPK build
+dsm/spk/_build/
+dsm/spk/*.spk
+
+# Test files
+hola
