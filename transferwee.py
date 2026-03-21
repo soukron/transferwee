@@ -582,10 +582,10 @@ def _storm_preflight_item(
     Return a dictionary with "blocks", "item_type" and "path" keys.
     """
     filename = _file_display_name(file, path_map)
-    filesize = os.path.getsize(file)
+    chunks = _file_chunks(file)
 
     return {
-        "blocks": [{"content_length": filesize}],
+        "blocks": [{"content_length": c["content_length"]} for c in chunks],
         "item_type": "file",
         "path": filename,
     }
@@ -620,6 +620,9 @@ def _storm_preflight(
     return r.json()
 
 
+STORM_MAX_BLOCK_SIZE = 15 * 1024 * 1024  # 15 MiB per WeTransfer limit
+
+
 def _md5(file: str) -> str:
     """Given a file, calculate its MD5 checksum.
 
@@ -632,23 +635,60 @@ def _md5(file: str) -> str:
     return h.hexdigest()
 
 
-def _storm_prepare_item(file: str) -> Dict[str, Union[int, str]]:
-    """Given a file, prepare the block for blocks dictionary.
+def _md5_chunk(file: str, offset: int, length: int) -> str:
+    """Given a file, offset and length, calculate MD5 of that chunk."""
+    h = hashlib.md5()
+    with open(file, "rb") as f:
+        f.seek(offset)
+        remaining = length
+        while remaining > 0:
+            data = f.read(min(4096, remaining))
+            if not data:
+                break
+            h.update(data)
+            remaining -= len(data)
+    return h.hexdigest()
 
-    Return a dictionary with "content_length" and "content_md5_hex" keys.
+
+def _file_chunks(file: str) -> List[Dict[str, Union[int, str]]]:
+    """Split a file into chunk descriptors for storm upload.
+
+    Each chunk has offset, content_length and content_md5_hex.
+    Files smaller than STORM_MAX_BLOCK_SIZE produce a single chunk.
     """
     filesize = os.path.getsize(file)
+    if filesize <= STORM_MAX_BLOCK_SIZE:
+        return [{"offset": 0, "content_length": filesize, "content_md5_hex": _md5(file)}]
+    chunks = []
+    offset = 0
+    while offset < filesize:
+        length = min(STORM_MAX_BLOCK_SIZE, filesize - offset)
+        chunks.append({
+            "offset": offset,
+            "content_length": length,
+            "content_md5_hex": _md5_chunk(file, offset, length),
+        })
+        offset += length
+    return chunks
 
-    return {"content_length": filesize, "content_md5_hex": _md5(file)}
 
-
-def _storm_prepare(authorization: str, filenames: List[str]) -> Dict[Any, Any]:
+def _storm_prepare(
+    authorization: str, filenames: List[str],
+) -> tuple:
     """Given an Authorization token and filenames prepare for block uploads.
 
-    Return the parsed JSON response.
+    Return (parsed JSON response, list of chunk lists per file).
     """
+    file_chunks = [_file_chunks(f) for f in filenames]
+    all_blocks = []
+    for chunks in file_chunks:
+        for chunk in chunks:
+            all_blocks.append({
+                "content_length": chunk["content_length"],
+                "content_md5_hex": chunk["content_md5_hex"],
+            })
     j = {
-        "blocks": [_storm_prepare_item(f) for f in filenames],
+        "blocks": all_blocks,
     }
     requests.options(
         _storm_urls(authorization)["WETRANSFER_STORM_BLOCK"],
@@ -672,44 +712,39 @@ def _storm_prepare(authorization: str, filenames: List[str]) -> Dict[Any, Any]:
     if not resp.get("ok", True) or "data" not in resp:
         err_msg = resp.get("error", {}).get("message", str(resp))
         raise Exception(f"Storm prepare failed: {err_msg}")
-    return resp
+    return resp, file_chunks
 
 
 def _storm_finalize_item(
-    file: str, block_id: str, path_map: Dict[str, str] = {},
+    file: str, block_ids: List[str], path_map: Dict[str, str] = {},
 ) -> Dict[str, Union[List[str], str]]:
-    """Given a file and block_id prepare the item block dictionary.
+    """Given a file and its block_ids prepare the item block dictionary.
 
     Return a dictionary with "block_ids", "item_type" and "path" keys.
-
-    XXX: Is it possible to actually have more than one block?
-    XXX: If yes this - and probably other parts of the code involved with
-    XXX: blocks - needs to be instructed to handle them instead of
-    XXX: assuming that one file is associated with one block.
     """
     filename = _file_display_name(file, path_map)
 
     return {
-        "block_ids": [
-            block_id,
-        ],
+        "block_ids": block_ids,
         "item_type": "file",
         "path": filename,
     }
 
 
 def _storm_finalize(
-    authorization: str, filenames: List[str], block_ids: List[str],
+    authorization: str, filenames: List[str],
+    file_block_ids: List[List[str]],
     path_map: Dict[str, str] = {},
 ) -> Dict[Any, Any]:
     """Given an Authorization token, filenames and block ids finalize upload.
 
+    file_block_ids is a list of lists: one list of block_ids per file.
     Return the parsed JSON response.
     """
     j = {
         "items": [
-            _storm_finalize_item(f, bid, path_map)
-            for f, bid in zip(filenames, block_ids)
+            _storm_finalize_item(f, bids, path_map)
+            for f, bids in zip(filenames, file_block_ids)
         ],
     }
     requests.options(
@@ -747,11 +782,18 @@ def _storm_finalize(
     return r.json()
 
 
-def _storm_upload(url: str, file: str) -> None:
-    """Given an url and file upload it.
+def _storm_upload(
+    url: str, file: str,
+    offset: int = 0, length: int = 0, md5_hex: str = "",
+) -> None:
+    """Given an url and file (or chunk) upload it.
 
-    Does not return anything.
+    When offset/length/md5_hex are provided, only that portion is uploaded.
+    Otherwise the entire file is uploaded.
     """
+    if not md5_hex:
+        md5_hex = _md5(file)
+        length = os.path.getsize(file)
     requests.options(
         url,
         headers={
@@ -761,13 +803,15 @@ def _storm_upload(url: str, file: str) -> None:
         },
     )
     with open(file, "rb") as f:
+        f.seek(offset)
+        data = f.read(length)
         requests.put(
             url,
-            data=f,
+            data=data,
             headers={
                 "Origin": "https://wetransfer.com",
                 "Content-MD5": binascii.b2a_base64(
-                    binascii.unhexlify(_md5(file)), newline=False
+                    binascii.unhexlify(md5_hex), newline=False
                 ),
                 "X-Uploader": "storm",
                 "User-Agent": WETRANSFER_USER_AGENT,
@@ -1016,15 +1060,30 @@ def upload(
     logger.debug("Doing preflight storm")
     _storm_preflight(transfer["storm_upload_token"], files, path_map)
     logger.debug("Preparing storm block upload")
-    blocks = _storm_prepare(transfer["storm_upload_token"], files)
-    for f, b in zip(files, blocks["data"]["blocks"]):
-        logger.debug(f"Uploading file {f}")
-        _storm_upload(b["presigned_put_url"], f)
+    resp, file_chunks = _storm_prepare(transfer["storm_upload_token"], files)
+    api_blocks = resp["data"]["blocks"]
+    block_idx = 0
+    file_block_ids = []
+    for f, chunks in zip(files, file_chunks):
+        block_ids = []
+        for chunk in chunks:
+            b = api_blocks[block_idx]
+            logger.debug(
+                f"Uploading {f} chunk offset={chunk['offset']} "
+                f"size={chunk['content_length']}"
+            )
+            _storm_upload(
+                b["presigned_put_url"], f,
+                chunk["offset"], chunk["content_length"], chunk["content_md5_hex"],
+            )
+            block_ids.append(b["block_id"])
+            block_idx += 1
+        file_block_ids.append(block_ids)
     logger.debug("Finalizing storm batch upload")
     _storm_finalize(
         transfer["storm_upload_token"],
         files,
-        [b["block_id"] for b in blocks["data"]["blocks"]],
+        file_block_ids,
         path_map,
     )
     logger.debug(f"Finalizing upload with transfer id {transfer['id']}")
