@@ -207,12 +207,19 @@ def download(url: str, file: str = "") -> None:
             f.write(chunk)
 
 
-def _file_name_and_size(file: str) -> Dict[str, Union[int, str]]:
+def _file_display_name(file: str, path_map: Dict[str, str] = {}) -> str:
+    """Return the display name for a file (relative path or basename)."""
+    return path_map.get(file, os.path.basename(file))
+
+
+def _file_name_and_size(
+    file: str, path_map: Dict[str, str] = {}
+) -> Dict[str, Union[int, str]]:
     """Given a file, prepare the "item_type", "name" and "size" dictionary.
 
     Return a dictionary with "item_type", "name" and "size" keys.
     """
-    filename = os.path.basename(file)
+    filename = _file_display_name(file, path_map)
     filesize = os.path.getsize(file)
 
     return {"item_type": "file", "name": filename, "size": filesize}
@@ -249,6 +256,7 @@ def _prepare_email_upload(
     sender: str,
     recipients: List[str],
     session: requests.Session,
+    path_map: Dict[str, str] = {},
 ) -> Dict[Any, Any]:
     """Given a list of filenames, message a sender and recipients prepare for
     the email upload.
@@ -259,7 +267,7 @@ def _prepare_email_upload(
 
     j = {
         "downloader_email_verification": "anonymous",
-        "files": [_file_name_and_size(f) for f in filenames],
+        "files": [_file_name_and_size(f, path_map) for f in filenames],
         "from": sender,
         "lsid": lsid,
         "display_name": display_name,
@@ -503,6 +511,7 @@ def _prepare_link_upload(
     message: str,
     session: requests.Session,
     authenticated: bool = False,
+    path_map: Dict[str, str] = {},
 ) -> Dict[Any, Any]:
     """Given a list of filenames and a message prepare for the link upload.
 
@@ -512,7 +521,7 @@ def _prepare_link_upload(
     Return the parsed JSON response.
     """
     j = {
-        "files": [_file_name_and_size(f) for f in filenames],
+        "files": [_file_name_and_size(f, path_map) for f in filenames],
         "display_name": display_name,
         "message": message,
         "ui_language": "en",
@@ -547,13 +556,13 @@ def _storm_urls(
 
 
 def _storm_preflight_item(
-    file: str,
+    file: str, path_map: Dict[str, str] = {},
 ) -> Dict[str, Union[List[Dict[str, int]], str]]:
     """Given a file, prepare the item block dictionary.
 
     Return a dictionary with "blocks", "item_type" and "path" keys.
     """
-    filename = os.path.basename(file)
+    filename = _file_display_name(file, path_map)
     filesize = os.path.getsize(file)
 
     return {
@@ -564,14 +573,14 @@ def _storm_preflight_item(
 
 
 def _storm_preflight(
-    authorization: str, filenames: List[str]
+    authorization: str, filenames: List[str], path_map: Dict[str, str] = {},
 ) -> Dict[Any, Any]:
     """Given an Authorization token and filenames do preflight for upload.
 
     Return the parsed JSON response.
     """
     j = {
-        "items": [_storm_preflight_item(f) for f in filenames],
+        "items": [_storm_preflight_item(f, path_map) for f in filenames],
     }
     requests.options(
         _storm_urls(authorization)["WETRANSFER_STORM_PREFLIGHT"],
@@ -648,7 +657,7 @@ def _storm_prepare(authorization: str, filenames: List[str]) -> Dict[Any, Any]:
 
 
 def _storm_finalize_item(
-    file: str, block_id: str
+    file: str, block_id: str, path_map: Dict[str, str] = {},
 ) -> Dict[str, Union[List[str], str]]:
     """Given a file and block_id prepare the item block dictionary.
 
@@ -659,7 +668,7 @@ def _storm_finalize_item(
     XXX: blocks - needs to be instructed to handle them instead of
     XXX: assuming that one file is associated with one block.
     """
-    filename = os.path.basename(file)
+    filename = _file_display_name(file, path_map)
 
     return {
         "block_ids": [
@@ -671,7 +680,8 @@ def _storm_finalize_item(
 
 
 def _storm_finalize(
-    authorization: str, filenames: List[str], block_ids: List[str]
+    authorization: str, filenames: List[str], block_ids: List[str],
+    path_map: Dict[str, str] = {},
 ) -> Dict[Any, Any]:
     """Given an Authorization token, filenames and block ids finalize upload.
 
@@ -679,7 +689,7 @@ def _storm_finalize(
     """
     j = {
         "items": [
-            _storm_finalize_item(f, bid)
+            _storm_finalize_item(f, bid, path_map)
             for f, bid in zip(filenames, block_ids)
         ],
     }
@@ -890,17 +900,40 @@ def upload(
     Return the short URL of the transfer on success.
     """
 
-    # Check that all files exists
-    logger.debug("Checking that all files exists")
+    # Expand directories recursively and build a path map that preserves
+    # relative folder structure (e.g. "hello/hello-1.txt") so that
+    # WeTransfer recreates the directory tree on download.
+    expanded: List[str] = []
+    path_map: Dict[str, str] = {}
     for f in files:
-        if not os.path.exists(f):
+        if os.path.isdir(f):
+            base_dir = f
+            for root, _dirs, fnames in os.walk(f):
+                for name in sorted(fnames):
+                    full = os.path.join(root, name)
+                    if os.path.getsize(full) == 0:
+                        logger.debug(f"Skipping empty file: {full}")
+                        continue
+                    rel = os.path.relpath(full, os.path.dirname(base_dir))
+                    expanded.append(full)
+                    path_map[full] = rel
+        elif os.path.exists(f):
+            if os.path.getsize(f) == 0:
+                logger.debug(f"Skipping empty file: {f}")
+                continue
+            expanded.append(f)
+        else:
             raise FileNotFoundError(f)
+    files = expanded
 
-    # Check that there are no duplicates filenames
-    # (despite possible different dirname())
-    logger.debug("Checking for no duplicate filenames")
-    filenames = [os.path.basename(f) for f in files]
-    if len(files) != len(set(filenames)):
+    if not files:
+        raise FileNotFoundError("No files to upload")
+
+    logger.debug(f"Uploading {len(files)} file(s)")
+
+    # Check that there are no duplicate display paths
+    display_names = [_file_display_name(f, path_map) for f in files]
+    if len(files) != len(set(display_names)):
         raise FileExistsError("Duplicate filenames")
 
     # Authenticate if credentials were provided
@@ -930,7 +963,7 @@ def upload(
     if sender and recipients:
         # email upload
         transfer = _prepare_email_upload(
-            files, display_name, message, sender, recipients, s
+            files, display_name, message, sender, recipients, s, path_map,
         )
         transfer = _verify_email_upload(transfer, s)
     else:
@@ -938,6 +971,7 @@ def upload(
         transfer = _prepare_link_upload(
             files, display_name, message, s,
             authenticated=auth_token is not None,
+            path_map=path_map,
         )
 
     logger.debug(
@@ -960,7 +994,7 @@ def upload(
     )
     logger.debug(f"Get transfer id {transfer['id']}")
     logger.debug("Doing preflight storm")
-    _storm_preflight(transfer["storm_upload_token"], files)
+    _storm_preflight(transfer["storm_upload_token"], files, path_map)
     logger.debug("Preparing storm block upload")
     blocks = _storm_prepare(transfer["storm_upload_token"], files)
     for f, b in zip(files, blocks["data"]["blocks"]):
@@ -971,6 +1005,7 @@ def upload(
         transfer["storm_upload_token"],
         files,
         [b["block_id"] for b in blocks["data"]["blocks"]],
+        path_map,
     )
     logger.debug(f"Finalizing upload with transfer id {transfer['id']}")
     shortened_url = _finalize_upload(transfer["id"], s)["shortened_url"]
