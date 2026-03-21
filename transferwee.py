@@ -350,12 +350,13 @@ def _save_auth_cache(
     email: str,
     access_token: str,
     refresh_token: Optional[str],
+    auth_file: Optional[str] = None,
 ) -> None:
     """Persist auth tokens to disk for later reuse."""
     if not refresh_token:
         return
-    cache_file = _auth_cache_path(email)
-    os.makedirs(WETRANSFER_AUTH_CACHE_DIR, mode=0o700, exist_ok=True)
+    cache_file = auth_file or _auth_cache_path(email)
+    os.makedirs(os.path.dirname(cache_file) or ".", mode=0o700, exist_ok=True)
     payload = {
         "email": email,
         "access_token": access_token,
@@ -367,12 +368,12 @@ def _save_auth_cache(
     logger.debug(f"Auth tokens cached to {cache_file}")
 
 
-def _load_cached_auth(email: str) -> Optional[str]:
+def _load_cached_auth(email: str, auth_file: Optional[str] = None) -> Optional[str]:
     """Try to obtain a fresh access_token using a cached refresh_token.
 
     Return access_token on success, None otherwise.
     """
-    cache_file = _auth_cache_path(email)
+    cache_file = auth_file or _auth_cache_path(email)
     if not os.path.exists(cache_file):
         logger.debug("No auth cache found")
         return None
@@ -413,7 +414,7 @@ def _load_cached_auth(email: str) -> Optional[str]:
     new_access = token_data.get("access_token")
     new_refresh = token_data.get("refresh_token", refresh_token)
     if new_access:
-        _save_auth_cache(email, new_access, new_refresh)
+        _save_auth_cache(email, new_access, new_refresh, auth_file)
         logger.debug("Token refresh successful")
         return new_access
 
@@ -470,16 +471,18 @@ def _authenticate_otp(email: str) -> Dict[str, str]:
     return result
 
 
-def _authenticate(email: str) -> str:
+def _authenticate(email: str, auth_file: Optional[str] = None) -> str:
     """Authenticate with WeTransfer.
 
     Tries cached refresh_token first (no user interaction needed).
     Falls back to passwordless OTP if no cache or refresh fails.
     Caches tokens after successful OTP for future runs.
 
+    When auth_file is provided it overrides the default cache path.
+
     Return access_token.
     """
-    token = _load_cached_auth(email)
+    token = _load_cached_auth(email, auth_file)
     if token:
         return token
 
@@ -489,6 +492,7 @@ def _authenticate(email: str) -> str:
         email,
         otp_result["access_token"],
         otp_result.get("refresh_token"),
+        auth_file,
     )
     return otp_result["access_token"]
 
@@ -635,7 +639,12 @@ def _storm_prepare(authorization: str, filenames: List[str]) -> Dict[Any, Any]:
             "User-Agent": WETRANSFER_USER_AGENT,
         },
     )
-    return r.json()
+    resp = r.json()
+    logger.debug(f"_storm_prepare response ({r.status_code}): {resp}")
+    if not resp.get("ok", True) or "data" not in resp:
+        err_msg = resp.get("error", {}).get("message", str(resp))
+        raise Exception(f"Storm prepare failed: {err_msg}")
+    return resp
 
 
 def _storm_finalize_item(
@@ -857,6 +866,7 @@ def upload(
     sender: Optional[str] = None,
     recipients: Optional[List[str]] = [],
     user: Optional[str] = None,
+    auth_file: Optional[str] = None,
 ) -> str:
     """Given a list of files upload them and return the corresponding URL.
 
@@ -895,7 +905,15 @@ def upload(
 
     # Authenticate if credentials were provided
     auth_token = None
-    if user:
+    if auth_file:
+        logger.debug(f"Authenticating from auth file: {auth_file}")
+        auth_token = _load_cached_auth("", auth_file)
+        if not auth_token:
+            raise ConnectionError(
+                f"Could not authenticate from {auth_file}. "
+                "The refresh token may have expired."
+            )
+    elif user:
         logger.debug(f"Authenticating as {user}")
         auth_token = _authenticate(user)
         logger.debug("Authentication successful")
@@ -1062,6 +1080,12 @@ if __name__ == "__main__":
         help="WeTransfer account email (or WETRANSFER_USER env var)",
     )
     up.add_argument(
+        "--auth-file",
+        type=str,
+        metavar="path",
+        help="path to auth cache JSON file (overrides -u and default cache)",
+    )
+    up.add_argument(
         "-v", action="store_true", help="get verbose/debug logging"
     )
     up.add_argument(
@@ -1096,6 +1120,7 @@ if __name__ == "__main__":
             upload(
                 args.files, args.n, args.m, args.f, args.t,
                 args.user,
+                args.auth_file,
             )
         )
         exit(0)
