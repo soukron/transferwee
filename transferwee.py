@@ -43,6 +43,7 @@ import string
 import uuid
 from typing import Any, Dict, List, Optional, Union
 import binascii
+import datetime
 import functools
 import hashlib
 import json
@@ -61,7 +62,23 @@ WETRANSFER_UPLOAD_URL = WETRANSFER_API_URL + "/{transfer_id}/passwordless"
 WETRANSFER_VERIFY_URL = WETRANSFER_API_URL + "/{transfer_id}/verify"
 WETRANSFER_FINALIZE_URL = WETRANSFER_API_URL + "/{transfer_id}/finalize"
 
-WETRANSFER_EXPIRE_IN = 604800
+WETRANSFER_EXPIRE_IN = 2592000  # 30 days
+
+
+_DURATION_KWARGS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
+
+
+def _parse_duration(value: str) -> int:
+    """Parse a duration string like '30d', '24h', '90m', '3600' into seconds."""
+    m = re.fullmatch(r"(\d+)\s*(s|m|h|d)?", value.strip().lower())
+    if not m:
+        raise ValueError(f"Invalid duration: {value!r}")
+    amount = int(m.group(1))
+    unit = m.group(2) or "s"
+    td = datetime.timedelta(**{_DURATION_KWARGS[unit]: amount})
+    return int(td.total_seconds())
+
+
 WETRANSFER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0"
 
 WETRANSFER_AUTH0_URL = "https://auth.wetransfer.com/oauth/token"
@@ -512,6 +529,7 @@ def _prepare_link_upload(
     session: requests.Session,
     authenticated: bool = False,
     path_map: Dict[str, str] = {},
+    expire_in: int = WETRANSFER_EXPIRE_IN,
 ) -> Dict[Any, Any]:
     """Given a list of filenames and a message prepare for the link upload.
 
@@ -525,6 +543,7 @@ def _prepare_link_upload(
         "display_name": display_name,
         "message": message,
         "ui_language": "en",
+        "expire_in": expire_in,
     }
     if not authenticated:
         j["anonymous_transfer"] = True
@@ -776,7 +795,6 @@ def _finalize_upload(
 def auth_list() -> None:
     """List all cached WeTransfer accounts and their token status."""
     import glob
-    import datetime
 
     pattern = os.path.join(WETRANSFER_AUTH_CACHE_DIR, "auth_*.json")
     cache_files = glob.glob(pattern)
@@ -877,6 +895,7 @@ def upload(
     recipients: Optional[List[str]] = [],
     user: Optional[str] = None,
     auth_file: Optional[str] = None,
+    expire_in: int = WETRANSFER_EXPIRE_IN,
 ) -> str:
     """Given a list of files upload them and return the corresponding URL.
 
@@ -972,6 +991,7 @@ def upload(
             files, display_name, message, s,
             authenticated=auth_token is not None,
             path_map=path_map,
+            expire_in=expire_in,
         )
 
     logger.debug(
@@ -1121,6 +1141,13 @@ if __name__ == "__main__":
         help="path to auth cache JSON file (overrides -u and default cache)",
     )
     up.add_argument(
+        "--expire-in",
+        type=str,
+        default="30d",
+        metavar="duration",
+        help="transfer expiration, e.g. 3600, 90m, 24h, 30d (default: 30d)",
+    )
+    up.add_argument(
         "-v", action="store_true", help="get verbose/debug logging"
     )
     up.add_argument(
@@ -1156,6 +1183,7 @@ if __name__ == "__main__":
                 args.files, args.n, args.m, args.f, args.t,
                 args.user,
                 args.auth_file,
+                _parse_duration(args.expire_in),
             )
         )
         exit(0)

@@ -102,7 +102,8 @@ to cache the tokens.
 ```
 % transferwee upload -h
 usage: transferwee upload [-h] [-n display_name] [-m message] [-f from]
-                          [-t to [to ...]] [-u email] [-v]
+                          [-t to [to ...]] [-u email] [--auth-file path]
+                          [--expire-in duration] [-v]
                           file [file ...]
 
 positional arguments:
@@ -116,6 +117,10 @@ optional arguments:
   -t to [to ...]        recipient emails
   -u email, --user email
                         WeTransfer account email (or WETRANSFER_USER env var)
+  --auth-file path      path to auth cache JSON file (overrides -u and default
+                        cache)
+  --expire-in duration  transfer expiration, e.g. 3600, 90m, 24h, 30d
+                        (default: 30d)
   -v                    get verbose/debug logging
 ```
 
@@ -144,6 +149,30 @@ Or using the environment variable:
 % export WETRANSFER_USER=user@example.com
 % transferwee upload hello
 https://we.tl/t-AbCdEfGhIj
+```
+
+#### Using an external auth cache file
+
+If you manage the auth cache outside the default `~/.config/transferwee/`
+directory (e.g. in a Docker container or a CI pipeline), you can point
+directly to a JSON cache file with `--auth-file`. This overrides both
+`-u` and `WETRANSFER_USER`:
+
+```
+% transferwee upload --auth-file /path/to/auth_cache.json hello
+https://we.tl/t-XyZwVuTsRq
+```
+
+#### Transfer expiration
+
+By default, link uploads expire after 30 days. Use `--expire-in` to set
+a custom duration. The value can be raw seconds or a human-readable
+shorthand (`s` seconds, `m` minutes, `h` hours, `d` days):
+
+```
+% transferwee upload --expire-in 7d hello          # expires in 7 days
+% transferwee upload --expire-in 12h hello         # expires in 12 hours
+% transferwee upload --expire-in 3600 hello        # expires in 1 hour
 ```
 
 ### Download file
